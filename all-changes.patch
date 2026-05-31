@@ -1,0 +1,1053 @@
+diff --git a/pom.xml b/pom.xml
+index 0cc45a0..47847db 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -51,6 +51,11 @@
+ 				</exclusion>
+ 			</exclusions>
+ 		</dependency>
++		<dependency>
++			<groupId>com.opencsv</groupId>
++			<artifactId>opencsv</artifactId>
++			<version>5.9</version>
++		</dependency>
+ 		<dependency>
+ 			<groupId>org.apache.httpcomponents</groupId>
+ 			<artifactId>httpclient</artifactId>
+@@ -69,7 +74,7 @@
+ 		<dependency>
+ 			<groupId>net.atos.mdi.commons</groupId>
+ 			<artifactId>commons</artifactId>
+-			<version>v1.0.49-SNAPSHOT-0</version>
++			<version>v1.0.50-SNAPSHOT-23</version>
+ 		</dependency>
+ 		<dependency>
+ 			<groupId>org.apache.camel.springboot</groupId>
+diff --git a/src/main/java/eg/com/mdi/batch/enums/FileTypeConfig.java b/src/main/java/eg/com/mdi/batch/enums/FileTypeConfig.java
+index d72ab40..61678df 100644
+--- a/src/main/java/eg/com/mdi/batch/enums/FileTypeConfig.java
++++ b/src/main/java/eg/com/mdi/batch/enums/FileTypeConfig.java
+@@ -1,6 +1,6 @@
+ package eg.com.mdi.batch.enums;
+ 
+-import eg.com.mdi.batch.mapper.MdpFieldSetMapper;
++import eg.com.mdi.batch.mapper.ABSFieldSetMapper;
+ import eg.com.mdi.batch.mapper.SkyBagFieldSetMapper;
+ import lombok.Getter;
+ import net.atos.mdi.commons.client.model.crm.CardDeliveryDetail;
+@@ -9,7 +9,7 @@ import org.springframework.batch.item.file.mapping.FieldSetMapper;
+ import java.util.Arrays;
+ 
+ public enum FileTypeConfig {
+-    MDP("MDP", new MdpFieldSetMapper()),
++    ABS("ABS", new ABSFieldSetMapper()),
+     SKY_BAG("SKYBAG", new SkyBagFieldSetMapper());
+ 
+     private final String type;
+@@ -23,7 +23,7 @@ public enum FileTypeConfig {
+ 
+     public static FileTypeConfig fromType(String type) {
+         return Arrays.stream(values())
+-                .filter(config -> config.name().equalsIgnoreCase(type))
++                .filter(config -> config.name().equalsIgnoreCase(type) || config.type.equalsIgnoreCase(type))
+                 .findFirst()
+                 .orElseThrow(() -> new IllegalArgumentException("Unknown file type: " + type));
+     }
+@@ -36,4 +36,4 @@ public enum FileTypeConfig {
+                         new IllegalArgumentException("Invalid file name. No matching FileTypeConfig found for: " + fileName)
+                 );
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/eg/com/mdi/batch/mapper/MdpFieldSetMapper.java b/src/main/java/eg/com/mdi/batch/mapper/ABSFieldSetMapper.java
+similarity index 94%
+rename from src/main/java/eg/com/mdi/batch/mapper/MdpFieldSetMapper.java
+rename to src/main/java/eg/com/mdi/batch/mapper/ABSFieldSetMapper.java
+index dee17cb..b360e56 100644
+--- a/src/main/java/eg/com/mdi/batch/mapper/MdpFieldSetMapper.java
++++ b/src/main/java/eg/com/mdi/batch/mapper/ABSFieldSetMapper.java
+@@ -4,7 +4,7 @@ import org.springframework.batch.item.file.transform.FieldSet;
+ 
+ import java.util.Arrays;
+ 
+-public class MdpFieldSetMapper extends AbstractCardDeliveryFieldSetMapper {
++public class ABSFieldSetMapper extends AbstractCardDeliveryFieldSetMapper {
+     @Override
+     protected boolean shouldSkip(FieldSet fieldSet) {
+         return Arrays.stream(fieldSet.getValues()).allMatch(String::isBlank);
+diff --git a/src/main/java/eg/com/mdi/batch/reader/FileReader.java b/src/main/java/eg/com/mdi/batch/reader/FileReader.java
+index c150be9..b0b77ea 100644
+--- a/src/main/java/eg/com/mdi/batch/reader/FileReader.java
++++ b/src/main/java/eg/com/mdi/batch/reader/FileReader.java
+@@ -1,19 +1,34 @@
+ package eg.com.mdi.batch.reader;
+ 
++import com.opencsv.CSVReader;
++import com.opencsv.CSVReaderBuilder;
+ import eg.com.mdi.batch.enums.FileTypeConfig;
+ import net.atos.mdi.commons.client.model.crm.CardDeliveryDetail;
++import org.jetbrains.annotations.NotNull;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.springframework.batch.core.configuration.annotation.StepScope;
++import org.springframework.batch.item.ExecutionContext;
++import org.springframework.batch.item.ItemStreamException;
+ import org.springframework.batch.item.ItemStreamReader;
+-import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
+-import org.springframework.batch.item.file.mapping.DefaultLineMapper;
+-import org.springframework.batch.item.file.transform.DelimitedLineTokenizer;
++import org.springframework.batch.item.file.transform.DefaultFieldSet;
++import org.springframework.batch.item.support.AbstractItemStreamItemReader;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.context.annotation.Bean;
+-import org.springframework.core.io.FileSystemResource;
+ import org.springframework.stereotype.Component;
+ 
++import java.io.FileInputStream;
++import java.io.InputStreamReader;
++import java.io.Reader;
++import java.nio.charset.StandardCharsets;
++import java.util.Arrays;
++import java.util.stream.Collectors;
++
+ @Component
+ public class FileReader {
++
++    private static final Logger log = LoggerFactory.getLogger(FileReader.class);
++
+     @Bean
+     @StepScope
+     public ItemStreamReader<CardDeliveryDetail> partitionedFileReader(
+@@ -21,24 +36,68 @@ public class FileReader {
+             @Value("#{jobParameters['fileType']}") String fileType,
+             @Value("#{stepExecutionContext['startLine']}") Long startLine,
+             @Value("#{stepExecutionContext['endLine']}") Long endLine) {
++
+         FileTypeConfig fileTypeConfig = FileTypeConfig.fromType(fileType);
+-        DelimitedLineTokenizer tokenizer = new DelimitedLineTokenizer();
+-        tokenizer.setDelimiter(",");
+-        tokenizer.setStrict(false);
+-        DefaultLineMapper<CardDeliveryDetail> lineMapper = new DefaultLineMapper<>();
+-        lineMapper.setLineTokenizer(tokenizer);
+-        lineMapper.setFieldSetMapper(fileTypeConfig.getMapper());
+-
+-        int linesToSkip = 1 + startLine.intValue();
+-        int maxItemCount = (int) (endLine - startLine);
+-
+-        return new FlatFileItemReaderBuilder<CardDeliveryDetail>()
+-                .name("csv-file-reader")
+-                .resource(new FileSystemResource(filePath))
+-                .encoding("UTF-8")
+-                .linesToSkip(linesToSkip)
+-                .maxItemCount(maxItemCount)
+-                .lineMapper(lineMapper)
+-                .build();
++
++        return new AbstractItemStreamItemReader<>() {
++            private CSVReader csvReader;
++            private long count = 0;
++            private final long maxCount = endLine - startLine;
++
++            @Override
++            public void open(@NotNull ExecutionContext executionContext) {
++                try {
++                    Reader reader = new InputStreamReader(new FileInputStream(filePath), StandardCharsets.UTF_8);
++                    csvReader = new CSVReaderBuilder(reader).build();
++                    csvReader.readNext();
++                    for (long skipped = 0; skipped < startLine; skipped++) {
++                        if (csvReader.readNext() == null) {
++                            break;
++                        }
++                    }
++                } catch (Exception e) {
++                    throw new ItemStreamException("Failed to open file: " + filePath, e);
++                }
++            }
++
++            @Override
++            public CardDeliveryDetail read() throws Exception {
++                if (count >= maxCount) return null;
++                String[] line;
++                while ((line = csvReader.readNext()) != null) {
++                    String[] cleaned = Arrays.stream(line)
++                            .map(cell -> {
++                                if (cell == null) return "";
++                                String collapsed = Arrays.stream(cell.split("[\\r\\n]+"))
++                                        .map(String::strip)
++                                        .filter(part -> !part.isBlank())
++                                        .collect(Collectors.joining(" "));
++                                if (!cell.strip().equals(collapsed)) {
++                                    log.warn("Cleaned noisy cell: [{}] -> [{}]",
++                                            cell.replace("\n", "\\n"), collapsed);
++                                }
++                                return collapsed;
++                            })
++                            .toArray(String[]::new);
++                    boolean hasData = Arrays.stream(cleaned).anyMatch(cell -> !cell.isBlank());
++                    if (!hasData) {
++                        log.warn("Skipping blank row at partition offset {}", count);
++                        continue;
++                    }
++                    count++;
++                    return fileTypeConfig.getMapper().mapFieldSet(new DefaultFieldSet(cleaned));
++                }
++                return null;
++            }
++
++            @Override
++            public void close() {
++                try {
++                    if (csvReader != null) csvReader.close();
++                } catch (Exception e) {
++                    log.error("Failed to close CSV reader", e);
++                }
++            }
++        };
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/eg/com/mdi/batch/util/FileRangePartitioner.java b/src/main/java/eg/com/mdi/batch/util/FileRangePartitioner.java
+index 092446e..7b2da1e 100644
+--- a/src/main/java/eg/com/mdi/batch/util/FileRangePartitioner.java
++++ b/src/main/java/eg/com/mdi/batch/util/FileRangePartitioner.java
+@@ -1,14 +1,16 @@
+ package eg.com.mdi.batch.util;
+ 
++import com.opencsv.CSVReader;
++import com.opencsv.CSVReaderBuilder;
+ import lombok.extern.log4j.Log4j2;
+ import net.atos.mdi.commons.web.exception.BackEndException;
+ import org.jetbrains.annotations.NotNull;
+ import org.springframework.batch.core.partition.support.Partitioner;
+ import org.springframework.batch.item.ExecutionContext;
+ 
+-import java.io.BufferedReader;
+-import java.io.FileReader;
+-import java.io.IOException;
++import java.io.FileInputStream;
++import java.io.InputStreamReader;
++import java.nio.charset.StandardCharsets;
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+@@ -32,7 +34,7 @@ public class FileRangePartitioner implements Partitioner {
+             int actualPartitions = (int) Math.ceil((double) totalLines / partitionSize);
+             log.info("Partitioning file: {}, totalLines: {}, partitionSize: {}, actualPartitions: {}", filePath, totalLines, partitionSize, actualPartitions);
+             createPartitions(actualPartitions, totalLines, partitions);
+-        } catch (IOException e) {
++        } catch (Exception e) {
+             throw new BackEndException(e.getMessage());
+         }
+         return partitions;
+@@ -51,9 +53,15 @@ public class FileRangePartitioner implements Partitioner {
+         }
+     }
+ 
+-    private int getTotalRows() throws IOException {
+-        try (var reader = new BufferedReader(new FileReader(filePath))) {
+-            return (int) (reader.lines().count() - 1);
++    private int getTotalRows() throws Exception {
++        try (var fileReader = new InputStreamReader(new FileInputStream(filePath), StandardCharsets.UTF_8);
++             CSVReader reader = new CSVReaderBuilder(fileReader).build()) {
++            reader.readNext();
++            int count = 0;
++            while (reader.readNext() != null) {
++                count++;
++            }
++            return count;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/eg/com/mdi/constant/Constants.java b/src/main/java/eg/com/mdi/constant/Constants.java
+index 83e04e4..bc735f5 100644
+--- a/src/main/java/eg/com/mdi/constant/Constants.java
++++ b/src/main/java/eg/com/mdi/constant/Constants.java
+@@ -28,9 +28,9 @@ public class Constants {
+ 	public static final String FILE_MOVED = "fileMoved";
+ 	public static final String FILE_TYPE = "fileType";
+ 	public static final String READER_FAILURE = "READER_FAILURE";
++	public static final String CORRUPTED_FILE_FAILURE = "CORRUPTED_FILE_FAILURE";
+ 	public static final String JOB_IN_PROGRESS = "IN_PROGRESS";
+-	public static final String INBOUND_CARD_DELIVERY_PROCESSING = "inbound-card-delivery-processing";
+-	public static final String INBOUND_MDP = "inbound-mdp";
++	public static final String INBOUND_ABS = "inbound-abs";
+ 	public static final String INBOUND_SKY_BAG = "inbound-skyBag";
+ 	public static final String JOB_STATUS = "jobStatus";
+ 	public static final String START_TIME = "startTime";
+diff --git a/src/main/java/eg/com/mdi/routes/carddelivery/InboundCardDeliveryProcessing.java b/src/main/java/eg/com/mdi/routes/carddelivery/CardDeliveryProcessingRoute.java
+similarity index 61%
+rename from src/main/java/eg/com/mdi/routes/carddelivery/InboundCardDeliveryProcessing.java
+rename to src/main/java/eg/com/mdi/routes/carddelivery/CardDeliveryProcessingRoute.java
+index 6d21e76..823326d 100644
+--- a/src/main/java/eg/com/mdi/routes/carddelivery/InboundCardDeliveryProcessing.java
++++ b/src/main/java/eg/com/mdi/routes/carddelivery/CardDeliveryProcessingRoute.java
+@@ -13,24 +13,17 @@ import lombok.RequiredArgsConstructor;
+ import org.apache.camel.Exchange;
+ import org.apache.camel.LoggingLevel;
+ import org.apache.camel.builder.RouteBuilder;
+-import org.apache.camel.spi.IdempotentRepository;
+-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.stereotype.Component;
+ 
+-import java.util.UUID;
+-
+ @Component
+ @RequiredArgsConstructor
+-@ConditionalOnProperty(
+-        name = "app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.card-delivery-processing.enabled",
+-        havingValue = "true",
+-        matchIfMissing = false
+-)
+-public class InboundCardDeliveryProcessing extends RouteBuilder {
++public class CardDeliveryProcessingRoute extends RouteBuilder {
++
++    public static final String DIRECT_CARD_DELIVERY_PROCESSING = "direct:card-delivery-processing";
++    public static final String CARD_DELIVERY_PROCESSING_FLOW = "card-delivery-processing-flow";
+ 
+     private final SftpUriBuilder sftpUriBuilder;
+     private final CardDeliveryProperties props;
+-    private final IdempotentRepository cardDeliveryIdempotentConsumerRepository;
+     private final CardDeliveryBatchingService batchProcessor;
+     private final CardDeliveryFileValidationProcessor cardDeliveryFileValidationProcessor;
+     private final CardDeliveryJobStatusValidationProcessor cardDeliveryJobStatusValidationProcessor;
+@@ -42,28 +35,17 @@ public class InboundCardDeliveryProcessing extends RouteBuilder {
+     public void configure() {
+         exceptionConfiguring();
+ 
+-        from(sftpUriBuilder.consumerUri(
+-                props.getRoutes().getStaging(),
+-                props.getInitialDelay(),
+-                props.getPollDelay(),
+-                props.getReadLock(),
+-                props.getReadTimeout()))
+-                .routeId(Constants.INBOUND_CARD_DELIVERY_PROCESSING)
+-                .setProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME, UUID::randomUUID)
+-                .setProperty("idempotentKey", simple("${routeId}::${header.CamelFileName}::${exchangeProperty.correlationId}"))
+-                .idempotentConsumer(simple("${routeId}::${header.CamelFileName}::${exchangeProperty.correlationId}"))
+-                .idempotentRepository(cardDeliveryIdempotentConsumerRepository)
+-                .skipDuplicate(true)
+-                .eager(false)
++        from(DIRECT_CARD_DELIVERY_PROCESSING)
++                .routeId(CARD_DELIVERY_PROCESSING_FLOW)
+                 .setProperty("originalFile", body())
+                 .process(cardDeliveryFileValidationProcessor)
+                 .process(cardDeliveryJobStatusValidationProcessor)
+                 .process(tempFileProcessor)
+                 .choice()
+-                .when(exchangeProperty(Constants.JOB_COMPLETED).isEqualTo(false))
+-                .process(batchProcessor::execute)
+-                .otherwise()
+-                .log("file already processed ${exchangeProperty.fileName}, skipping file")
++                    .when(exchangeProperty(Constants.JOB_COMPLETED).isEqualTo(false))
++                        .process(batchProcessor::execute)
++                    .otherwise()
++                        .log("file already processed ${exchangeProperty.fileName}, skipping file")
+                 .end()
+                 .process(tempFileCleanupProcessor)
+                 .to(sftpUriBuilder.producerUri(props.getRoutes().getProcessed()))
+@@ -72,20 +54,38 @@ public class InboundCardDeliveryProcessing extends RouteBuilder {
+ 
+     private void exceptionConfiguring() {
+         onException(Exception.class)
++                .onWhen(exchange -> exchange.getProperty(Constants.CORRUPTED_FILE_FAILURE) != null
++                        || exchange.getProperty(Constants.READER_FAILURE) != null)
+                 .handled(true)
+                 .process(tempFileCleanupProcessor)
+                 .process(exchange -> {
+                     Exception ex = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class);
+-                    log.error("Full exception for file: {} with id: {}",
++                    log.error("Corrupted file failure for file: {} with id: {}",
+                             exchange.getIn().getHeader(Exchange.FILE_NAME),
+                             exchange.getProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME),
+                             ex);
+-                    if (exchange.getProperty(Constants.READER_FAILURE) != null)
++                    if (exchange.getProperty(Constants.READER_FAILURE) != null) {
+                         idempotencyHandler.handleCorruptedFile(exchange);
++                    }
+                 })
+                 .log(LoggingLevel.ERROR,
+                         "Failed for file ${header.CamelFileName} with id: ${exchangeProperty.correlationId}. "
+                                 + "Error: ${exception.message}. Cause: ${exception.cause}")
+                 .to(sftpUriBuilder.producerUri(props.getRoutes().getFailed()));
++
++        onException(Exception.class)
++                .handled(false)
++                .process(tempFileCleanupProcessor)
++                .process(exchange -> {
++                    Exception ex = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Exception.class);
++                    log.error("Retryable failure for file: {} with id: {}",
++                            exchange.getIn().getHeader(Exchange.FILE_NAME),
++                            exchange.getProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME),
++                            ex);
++                })
++                .log(LoggingLevel.ERROR,
++                        "Retryable failure for file ${header.CamelFileName} with id: ${exchangeProperty.correlationId}. "
++                                + "Error: ${exception.message}. Cause: ${exception.cause}")
++                .to(sftpUriBuilder.producerUri(props.getRoutes().getFailed()));
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/eg/com/mdi/routes/carddelivery/InboundMDP.java b/src/main/java/eg/com/mdi/routes/carddelivery/InboundABS.java
+similarity index 69%
+rename from src/main/java/eg/com/mdi/routes/carddelivery/InboundMDP.java
+rename to src/main/java/eg/com/mdi/routes/carddelivery/InboundABS.java
+index 0ad1e3b..f992b7f 100644
+--- a/src/main/java/eg/com/mdi/routes/carddelivery/InboundMDP.java
++++ b/src/main/java/eg/com/mdi/routes/carddelivery/InboundABS.java
+@@ -1,7 +1,7 @@
+ package eg.com.mdi.routes.carddelivery;
+ 
+ import eg.com.mdi.constant.Constants;
+-import eg.com.mdi.routes.carddelivery.util.RouteExceptionHandler;
++import eg.com.mdi.batch.enums.FileTypeConfig;
+ import org.apache.camel.builder.RouteBuilder;
+ import org.apache.camel.spi.IdempotentRepository;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+@@ -11,24 +11,21 @@ import java.util.UUID;
+ 
+ @Component
+ @ConditionalOnProperty(
+-        name = "app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.mdp.enabled",
++        name = "app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.abs.enabled",
+         havingValue = "true",
+         matchIfMissing = false
+ )
+-public class InboundMDP extends RouteBuilder {
++public class InboundABS extends RouteBuilder {
+ 
+     private final IdempotentRepository cardDeliveryIdempotentConsumerRepository;
+-    private final RouteExceptionHandler routeExceptionHandler;
+ 
+-    public InboundMDP(IdempotentRepository cardDeliveryIdempotentConsumerRepository, RouteExceptionHandler routeExceptionHandler) {
++    public InboundABS(IdempotentRepository cardDeliveryIdempotentConsumerRepository) {
+         this.cardDeliveryIdempotentConsumerRepository = cardDeliveryIdempotentConsumerRepository;
+-        this.routeExceptionHandler = routeExceptionHandler;
+     }
+ 
+     @Override
+     public void configure() {
+-        routeExceptionHandler.configuration();
+-        from("file:{{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.mdp.source}}"
++        from("file:{{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.abs.source}}"
+                 + "?noop=true"
+                 + "&initialDelay={{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.initial-delay}}"
+                 + "&delay={{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.poll-delay}}"
+@@ -38,15 +35,14 @@ public class InboundMDP extends RouteBuilder {
+                 + "&readLockTimeout={{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.read-timeout}}"
+                 + "&startingDirectoryMustExist=true"
+                 + "&directoryMustExist=true")
+-                .routeId(Constants.INBOUND_MDP)
++                .routeId(Constants.INBOUND_ABS)
+                 .setProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME, UUID::randomUUID)
+                 .setProperty("idempotentKey", simple("${routeId}::${header.CamelFileName}::${exchangeProperty.correlationId}"))
+                 .idempotentConsumer(simple("${routeId}::${header.CamelFileName}::${exchangeProperty.correlationId}"))
+                 .idempotentRepository(cardDeliveryIdempotentConsumerRepository)
+                 .skipDuplicate(true)
+                 .eager(false)
+-                .setProperty("originalFile", body())
+-                .to("file:{{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.target}}")
+-                .log("file: ${header.CamelFileName} with id: ${exchangeProperty.correlationId} was successfully Moved to onebank's SFTP");
++                .setProperty(Constants.FILE_TYPE, constant(FileTypeConfig.ABS.name()))
++                .to(CardDeliveryProcessingRoute.DIRECT_CARD_DELIVERY_PROCESSING);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/eg/com/mdi/routes/carddelivery/InboundSkyBag.java b/src/main/java/eg/com/mdi/routes/carddelivery/InboundSkyBag.java
+index 74548d1..e87d44c 100644
+--- a/src/main/java/eg/com/mdi/routes/carddelivery/InboundSkyBag.java
++++ b/src/main/java/eg/com/mdi/routes/carddelivery/InboundSkyBag.java
+@@ -1,7 +1,7 @@
+ package eg.com.mdi.routes.carddelivery;
+ 
++import eg.com.mdi.batch.enums.FileTypeConfig;
+ import eg.com.mdi.constant.Constants;
+-import eg.com.mdi.routes.carddelivery.util.RouteExceptionHandler;
+ import org.apache.camel.builder.RouteBuilder;
+ import org.apache.camel.spi.IdempotentRepository;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+@@ -17,18 +17,14 @@ import java.util.UUID;
+ )
+ public class InboundSkyBag extends RouteBuilder {
+ 
+-    public static final String INBOUND_SKY_BAG = "inbound-skyBag";
+     private final IdempotentRepository cardDeliveryIdempotentConsumerRepository;
+-    private final RouteExceptionHandler routeExceptionHandler;
+ 
+-    public InboundSkyBag(IdempotentRepository cardDeliveryIdempotentConsumerRepository, RouteExceptionHandler routeExceptionHandler) {
++    public InboundSkyBag(IdempotentRepository cardDeliveryIdempotentConsumerRepository) {
+         this.cardDeliveryIdempotentConsumerRepository = cardDeliveryIdempotentConsumerRepository;
+-        this.routeExceptionHandler = routeExceptionHandler;
+     }
+ 
+     @Override
+     public void configure() {
+-        routeExceptionHandler.configuration();
+         from("file:{{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.sky-bag.source}}"
+                 + "?noop=true"
+                 + "&initialDelay={{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.initial-delay}}"
+@@ -46,8 +42,7 @@ public class InboundSkyBag extends RouteBuilder {
+                 .idempotentRepository(cardDeliveryIdempotentConsumerRepository)
+                 .skipDuplicate(true)
+                 .eager(false)
+-                .setProperty("originalFile", body())
+-                .to("file:{{app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.target}}")
+-                .log("file: ${header.CamelFileName} with id: ${exchangeProperty.correlationId} was successfully Moved to onebank's SFTP");
++                .setProperty(Constants.FILE_TYPE, constant(FileTypeConfig.SKY_BAG.name()))
++                .to(CardDeliveryProcessingRoute.DIRECT_CARD_DELIVERY_PROCESSING);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/java/eg/com/mdi/routes/carddelivery/processors/CardDeliveryFileValidationProcessor.java b/src/main/java/eg/com/mdi/routes/carddelivery/processors/CardDeliveryFileValidationProcessor.java
+index 1eb135d..c15c5d9 100644
+--- a/src/main/java/eg/com/mdi/routes/carddelivery/processors/CardDeliveryFileValidationProcessor.java
++++ b/src/main/java/eg/com/mdi/routes/carddelivery/processors/CardDeliveryFileValidationProcessor.java
+@@ -28,10 +28,11 @@ public class CardDeliveryFileValidationProcessor implements Processor {
+                 throw new IllegalArgumentException("Empty file");
+             String simpleFileName = Paths.get(originalName).getFileName().toString();
+             String fileName = validateAndExtractFileName(simpleFileName);
+-            String fileType = FileTypeConfig.fromFileName(fileName).name();
++            String fileType = resolveFileType(exchange, fileName);
+             exchange.setProperty(Constants.FILE_NAME, fileName);
+             exchange.setProperty(Constants.FILE_TYPE, fileType);
+         } catch (Exception e) {
++            exchange.setProperty(Constants.CORRUPTED_FILE_FAILURE, true);
+             idempotencyHandler.handleCorruptedFile(exchange);
+             throw e;
+         }
+@@ -44,4 +45,12 @@ public class CardDeliveryFileValidationProcessor implements Processor {
+         }
+         return FileOperationUtils.extractFileName(originalName);
+     }
+-}
+\ No newline at end of file
++
++    private String resolveFileType(Exchange exchange, String fileName) {
++        String routeFileType = exchange.getProperty(Constants.FILE_TYPE, String.class);
++        if (routeFileType != null && !routeFileType.isBlank()) {
++            return FileTypeConfig.fromType(routeFileType).name();
++        }
++        return FileTypeConfig.fromFileName(fileName).name();
++    }
++}
+diff --git a/src/test/java/eg/com/mdi/batch/mapper/MdpFieldSetMapperTest.java b/src/test/java/eg/com/mdi/batch/mapper/ABSFieldSetMapperTest.java
+similarity index 94%
+rename from src/test/java/eg/com/mdi/batch/mapper/MdpFieldSetMapperTest.java
+rename to src/test/java/eg/com/mdi/batch/mapper/ABSFieldSetMapperTest.java
+index 8117660..760774e 100644
+--- a/src/test/java/eg/com/mdi/batch/mapper/MdpFieldSetMapperTest.java
++++ b/src/test/java/eg/com/mdi/batch/mapper/ABSFieldSetMapperTest.java
+@@ -7,9 +7,9 @@ import org.junit.jupiter.api.Test;
+ import org.springframework.batch.item.file.transform.DefaultFieldSet;
+ import org.springframework.batch.item.file.transform.FieldSet;
+ 
+-class MdpFieldSetMapperTest {
++class ABSFieldSetMapperTest {
+ 
+-    private final MdpFieldSetMapper mapper = new MdpFieldSetMapper();
++    private final ABSFieldSetMapper mapper = new ABSFieldSetMapper();
+ 
+     @Test
+     void shouldReturnNullWhenAllFieldsBlank() {
+diff --git a/src/test/java/eg/com/mdi/batch/reader/FileReaderTest.java b/src/test/java/eg/com/mdi/batch/reader/FileReaderTest.java
+new file mode 100644
+index 0000000..211a9ff
+--- /dev/null
++++ b/src/test/java/eg/com/mdi/batch/reader/FileReaderTest.java
+@@ -0,0 +1,42 @@
++package eg.com.mdi.batch.reader;
++
++import eg.com.mdi.constant.Constants;
++import net.atos.mdi.commons.client.model.crm.CardDeliveryDetail;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.springframework.batch.item.ExecutionContext;
++import org.springframework.batch.item.ItemStreamReader;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++
++class FileReaderTest {
++
++    @TempDir
++    Path tempDir;
++
++    @Test
++    void shouldCollapseMultilineArabicCellIntoSingleString() throws Exception {
++        Path file = tempDir.resolve("ABS_multiline.csv");
++        Files.writeString(file, """
++                courier,pod,pickup,vpan,customer,card,address,mobile,status,reason,delivery,sms,unused,appointment,receiver
++                DHL,POD123,2024-01-01,VPAN123,Ahmed,VISA,"شارع النيل
++                الدور الثاني",201001234567,DELIVERED,None,2024-01-02,2024-01-03,unused,2024-01-04,محمد
++                """, StandardCharsets.UTF_8);
++
++        ItemStreamReader<CardDeliveryDetail> reader = new FileReader().partitionedFileReader(
++                file.toString(), "ABS", 0L, 1L);
++
++        reader.open(new ExecutionContext());
++        CardDeliveryDetail detail = reader.read();
++        reader.close();
++
++        assertNotNull(detail);
++        assertEquals("شارع النيل الدور الثاني", detail.getAddress());
++        assertEquals("محمد", detail.getReceivableName());
++    }
++}
+diff --git a/src/test/java/eg/com/mdi/batch/util/FileRangePartitionerTest.java b/src/test/java/eg/com/mdi/batch/util/FileRangePartitionerTest.java
+new file mode 100644
+index 0000000..1e9837b
+--- /dev/null
++++ b/src/test/java/eg/com/mdi/batch/util/FileRangePartitionerTest.java
+@@ -0,0 +1,37 @@
++package eg.com.mdi.batch.util;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.springframework.batch.item.ExecutionContext;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++class FileRangePartitionerTest {
++
++    @TempDir
++    Path tempDir;
++
++    @Test
++    void shouldPartitionByCsvRecordsNotPhysicalLines() throws Exception {
++        Path file = tempDir.resolve("ABS_multiline.csv");
++        Files.writeString(file, """
++                h1,h2
++                value1,"line one
++                line two"
++                value2,value3
++                """, StandardCharsets.UTF_8);
++
++        Map<String, ExecutionContext> partitions = new FileRangePartitioner(file.toString(), 1).partition(1);
++
++        assertEquals(2, partitions.size());
++        assertEquals(0L, partitions.get("partition0").getLong("startLine"));
++        assertEquals(1L, partitions.get("partition0").getLong("endLine"));
++        assertEquals(1L, partitions.get("partition1").getLong("startLine"));
++        assertEquals(2L, partitions.get("partition1").getLong("endLine"));
++    }
++}
+diff --git a/src/test/java/eg/com/mdi/routes/carddelivery/InboundCardDeliveryProcessingTest.java b/src/test/java/eg/com/mdi/routes/carddelivery/CardDeliveryProcessingRouteTest.java
+similarity index 63%
+rename from src/test/java/eg/com/mdi/routes/carddelivery/InboundCardDeliveryProcessingTest.java
+rename to src/test/java/eg/com/mdi/routes/carddelivery/CardDeliveryProcessingRouteTest.java
+index b027a2a..d97982b 100644
+--- a/src/test/java/eg/com/mdi/routes/carddelivery/InboundCardDeliveryProcessingTest.java
++++ b/src/test/java/eg/com/mdi/routes/carddelivery/CardDeliveryProcessingRouteTest.java
+@@ -11,17 +11,17 @@ import eg.com.mdi.service.CardDeliveryBatchingService;
+ import eg.com.mdi.util.SftpUriBuilder;
+ import org.apache.camel.builder.AdviceWith;
+ import org.apache.camel.builder.RouteBuilder;
++import org.apache.camel.CamelExecutionException;
+ import org.apache.camel.component.mock.MockEndpoint;
+-import org.apache.camel.spi.IdempotentRepository;
+ import org.apache.camel.test.junit5.CamelTestSupport;
+ import org.junit.jupiter.api.Test;
+ import org.mockito.Mockito;
+ 
++import static org.junit.jupiter.api.Assertions.assertThrows;
+ 
+-class InboundCardDeliveryProcessingTest extends CamelTestSupport {
++class CardDeliveryProcessingRouteTest extends CamelTestSupport {
+ 
+     private final SftpUriBuilder sftpUriBuilder = Mockito.mock(SftpUriBuilder.class);
+-    private final IdempotentRepository idempotentRepository = Mockito.mock(IdempotentRepository.class);
+     private final CardDeliveryBatchingService batchService = Mockito.mock(CardDeliveryBatchingService.class);
+     private final CardDeliveryFileValidationProcessor fileValidation = Mockito.mock(CardDeliveryFileValidationProcessor.class);
+     private final CardDeliveryJobStatusValidationProcessor jobValidation = Mockito.mock(CardDeliveryJobStatusValidationProcessor.class);
+@@ -29,36 +29,13 @@ class InboundCardDeliveryProcessingTest extends CamelTestSupport {
+     private final TempFileCleanupProcessor cleanupProcessor = Mockito.mock(TempFileCleanupProcessor.class);
+     private final IdempotencyHandler idempotencyHandler = Mockito.mock(IdempotencyHandler.class);
+ 
+-    private CardDeliveryProperties buildProps() {
+-        CardDeliveryProperties props = new CardDeliveryProperties();
+-        props.setInitialDelay(100);
+-        props.setPollDelay(1000);
+-        props.setReadLock(1000);
+-        props.setReadTimeout("1m");
+-        CardDeliveryProperties.Routes routes = new CardDeliveryProperties.Routes();
+-        routes.setStaging("/home/appuser/staging");
+-        routes.setProcessed("/home/appuser/processed");
+-        routes.setFailed("/home/appuser/failed");
+-        props.setRoutes(routes);
+-
+-        return props;
+-    }
+-
+     @Override
+     protected RouteBuilder createRouteBuilder() {
+-        Mockito.when(sftpUriBuilder.consumerUri(
+-                Mockito.anyString(),
+-                Mockito.anyLong(),
+-                Mockito.anyLong(),
+-                Mockito.anyLong(),
+-                Mockito.anyString()
+-        )).thenReturn("direct:start");
+         Mockito.when(sftpUriBuilder.producerUri(Mockito.contains("processed"))).thenReturn("mock:processed");
+         Mockito.when(sftpUriBuilder.producerUri(Mockito.contains("failed"))).thenReturn("mock:failed");
+-        return new InboundCardDeliveryProcessing(
++        return new CardDeliveryProcessingRoute(
+                 sftpUriBuilder,
+                 buildProps(),
+-                idempotentRepository,
+                 batchService,
+                 fileValidation,
+                 jobValidation,
+@@ -75,40 +52,69 @@ class InboundCardDeliveryProcessingTest extends CamelTestSupport {
+ 
+     @Test
+     void shouldExecuteBatchWhenJobNotCompleted() throws Exception {
+-        AdviceWith.adviceWith(context, Constants.INBOUND_CARD_DELIVERY_PROCESSING, route -> route.weaveAddLast().to("mock:result"));
++        AdviceWith.adviceWith(context, CardDeliveryProcessingRoute.CARD_DELIVERY_PROCESSING_FLOW,
++                route -> route.weaveAddLast().to("mock:result"));
+         context.start();
+-        template.sendBodyAndProperty("direct:start", "file-content", Constants.JOB_COMPLETED, false);
++        template.sendBodyAndProperty(CardDeliveryProcessingRoute.DIRECT_CARD_DELIVERY_PROCESSING,
++                "file-content", Constants.JOB_COMPLETED, false);
+         Mockito.verify(batchService).execute(Mockito.any());
+         Mockito.verify(cleanupProcessor).process(Mockito.any());
+     }
+ 
+     @Test
+     void shouldSkipBatchWhenJobCompleted() throws Exception {
+-        AdviceWith.adviceWith(context, Constants.INBOUND_CARD_DELIVERY_PROCESSING, route -> route.weaveAddLast().to("mock:result"));
++        AdviceWith.adviceWith(context, CardDeliveryProcessingRoute.CARD_DELIVERY_PROCESSING_FLOW,
++                route -> route.weaveAddLast().to("mock:result"));
+         context.start();
+-        template.sendBodyAndProperty("direct:start", "file-content", Constants.JOB_COMPLETED, true);
++        template.sendBodyAndProperty(CardDeliveryProcessingRoute.DIRECT_CARD_DELIVERY_PROCESSING,
++                "file-content", Constants.JOB_COMPLETED, true);
+         Mockito.verify(batchService, Mockito.never()).execute(Mockito.any());
+         Mockito.verify(cleanupProcessor).process(Mockito.any());
+     }
+ 
+     @Test
+-    void shouldRouteToFailedOnException() throws Exception {
+-        AdviceWith.adviceWith(context, Constants.INBOUND_CARD_DELIVERY_PROCESSING, route -> route.replaceFromWith("direct:start"));
++    void shouldHandleCorruptedFileFailure() throws Exception {
++        AdviceWith.adviceWith(context, CardDeliveryProcessingRoute.CARD_DELIVERY_PROCESSING_FLOW,
++                route -> route.replaceFromWith("direct:start"));
+         context.start();
+         Mockito.doThrow(new RuntimeException("validation error")).when(fileValidation).process(Mockito.any());
+         MockEndpoint failedEndpoint = getMockEndpoint("mock:failed");
+         failedEndpoint.expectedMessageCount(1);
+-        template.sendBody("direct:start", "file-content");
++        template.sendBodyAndProperty("direct:start", "file-content", Constants.CORRUPTED_FILE_FAILURE, true);
+         failedEndpoint.assertIsSatisfied();
+         Mockito.verify(cleanupProcessor).process(Mockito.any());
+     }
+ 
++    @Test
++    void shouldPropagateRetryableFailureWithoutProtectingIdempotency() throws Exception {
++        AdviceWith.adviceWith(context, CardDeliveryProcessingRoute.CARD_DELIVERY_PROCESSING_FLOW,
++                route -> route.replaceFromWith("direct:start"));
++        context.start();
++        Mockito.doThrow(new RuntimeException("crm down")).when(batchService).execute(Mockito.any());
++        MockEndpoint failedEndpoint = getMockEndpoint("mock:failed");
++        failedEndpoint.expectedMessageCount(1);
++        assertThrows(CamelExecutionException.class,
++                () -> template.sendBodyAndProperty("direct:start", "file-content", Constants.JOB_COMPLETED, false));
++        failedEndpoint.assertIsSatisfied();
++        Mockito.verify(idempotencyHandler, Mockito.never()).handleCorruptedFile(Mockito.any());
++    }
++
+     @Test
+     void shouldCallIdempotencyHandlerOnReaderFailure() throws Exception {
+-        AdviceWith.adviceWith(context, Constants.INBOUND_CARD_DELIVERY_PROCESSING, route -> route.replaceFromWith("direct:start"));
++        AdviceWith.adviceWith(context, CardDeliveryProcessingRoute.CARD_DELIVERY_PROCESSING_FLOW,
++                route -> route.replaceFromWith("direct:start"));
+         context.start();
+         Mockito.doThrow(new RuntimeException("reader error")).when(fileValidation).process(Mockito.any());
+         template.sendBodyAndProperty("direct:start", "file-content", Constants.READER_FAILURE, true);
+         Mockito.verify(idempotencyHandler).handleCorruptedFile(Mockito.any());
+     }
+-}
+\ No newline at end of file
++
++    private CardDeliveryProperties buildProps() {
++        CardDeliveryProperties props = new CardDeliveryProperties();
++        CardDeliveryProperties.Routes routes = new CardDeliveryProperties.Routes();
++        routes.setProcessed("/processed");
++        routes.setFailed("/failed");
++        props.setRoutes(routes);
++        return props;
++    }
++}
+diff --git a/src/test/java/eg/com/mdi/routes/carddelivery/InboundMDPTest.java b/src/test/java/eg/com/mdi/routes/carddelivery/InboundABSTest.java
+similarity index 54%
+rename from src/test/java/eg/com/mdi/routes/carddelivery/InboundMDPTest.java
+rename to src/test/java/eg/com/mdi/routes/carddelivery/InboundABSTest.java
+index f1f6c25..6567460 100644
+--- a/src/test/java/eg/com/mdi/routes/carddelivery/InboundMDPTest.java
++++ b/src/test/java/eg/com/mdi/routes/carddelivery/InboundABSTest.java
+@@ -1,7 +1,6 @@
+ package eg.com.mdi.routes.carddelivery;
+ 
+ import eg.com.mdi.constant.Constants;
+-import eg.com.mdi.routes.carddelivery.util.RouteExceptionHandler;
+ import org.apache.camel.RoutesBuilder;
+ import org.apache.camel.builder.AdviceWith;
+ import org.apache.camel.component.mock.MockEndpoint;
+@@ -12,14 +11,17 @@ import org.mockito.Mockito;
+ 
+ import java.util.Properties;
+ 
+-class InboundMDPTest extends CamelTestSupport {
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.when;
++
++class InboundABSTest extends CamelTestSupport {
+ 
+     private final IdempotentRepository idempotentRepository = Mockito.mock(IdempotentRepository.class);
+-    private final RouteExceptionHandler routeExceptionHandler = Mockito.mock(RouteExceptionHandler.class);
+ 
+     @Override
+     protected RoutesBuilder createRouteBuilder() {
+-        return new InboundMDP(idempotentRepository, routeExceptionHandler);
++        when(idempotentRepository.add(anyString())).thenReturn(true);
++        return new InboundABS(idempotentRepository);
+     }
+ 
+     @Override
+@@ -27,10 +29,14 @@ class InboundMDPTest extends CamelTestSupport {
+         Properties props = new Properties();
+         props.put("app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.mdp.source",
+                 "target/input");
+-        props.put("app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.target",
+-                "target/output");
++        props.put("app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.initial-delay",
++                "0");
+         props.put("app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.poll-delay",
+                 "1000");
++        props.put("app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.read-lock",
++                "1000");
++        props.put("app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.read-timeout",
++                "1m");
+         return props;
+     }
+ 
+@@ -40,15 +46,20 @@ class InboundMDPTest extends CamelTestSupport {
+     }
+ 
+     @Test
+-    void shouldMoveFileFromSourceToTarget() throws Exception {
+-        AdviceWith.adviceWith(context, Constants.INBOUND_MDP, route -> {
++    void shouldSendFileToSharedProcessingRouteWithAbsFileType() throws Exception {
++        AdviceWith.adviceWith(context, Constants.INBOUND_ABS, route -> {
+             route.replaceFromWith("direct:start");
+-            route.mockEndpointsAndSkip("file:*");
++            route.weaveByToUri(CardDeliveryProcessingRoute.DIRECT_CARD_DELIVERY_PROCESSING)
++                    .replace()
++                    .to("mock:processing");
+         });
+         context.start();
+-        MockEndpoint target = getMockEndpoint("mock:file:target/output");
++        MockEndpoint target = getMockEndpoint("mock:processing");
+         target.expectedMessageCount(1);
++        target.expectedPropertyReceived(Constants.FILE_TYPE, "ABS");
++        target.expectedMessagesMatches(exchange ->
++                exchange.getProperty("idempotentKey", String.class).startsWith(Constants.INBOUND_ABS + "::test-file.txt::"));
+         template.sendBodyAndHeader("direct:start", "file-content", "CamelFileName", "test-file.txt");
+         target.assertIsSatisfied();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/test/java/eg/com/mdi/routes/carddelivery/InboundSkyBagTest.java b/src/test/java/eg/com/mdi/routes/carddelivery/InboundSkyBagTest.java
+index 12e9c63..6a36ac7 100644
+--- a/src/test/java/eg/com/mdi/routes/carddelivery/InboundSkyBagTest.java
++++ b/src/test/java/eg/com/mdi/routes/carddelivery/InboundSkyBagTest.java
+@@ -1,7 +1,6 @@
+ package eg.com.mdi.routes.carddelivery;
+ 
+ import eg.com.mdi.constant.Constants;
+-import eg.com.mdi.routes.carddelivery.util.RouteExceptionHandler;
+ import org.apache.camel.RoutesBuilder;
+ import org.apache.camel.builder.AdviceWith;
+ import org.apache.camel.component.mock.MockEndpoint;
+@@ -12,14 +11,17 @@ import org.mockito.Mockito;
+ 
+ import java.util.Properties;
+ 
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.when;
++
+ class InboundSkyBagTest extends CamelTestSupport {
+ 
+     private final IdempotentRepository idempotentRepository = Mockito.mock(IdempotentRepository.class);
+-    private final RouteExceptionHandler routeExceptionHandler = Mockito.mock(RouteExceptionHandler.class);
+ 
+     @Override
+     protected RoutesBuilder createRouteBuilder() {
+-        return new InboundSkyBag(idempotentRepository, routeExceptionHandler);
++        when(idempotentRepository.add(anyString())).thenReturn(true);
++        return new InboundSkyBag(idempotentRepository);
+     }
+ 
+     @Override
+@@ -30,13 +32,21 @@ class InboundSkyBagTest extends CamelTestSupport {
+                 "target/input"
+         );
+         props.put(
+-                "app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.routes.target",
+-                "target/output"
++                "app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.initial-delay",
++                "0"
+         );
+         props.put(
+                 "app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.poll-delay",
+                 "1000"
+         );
++        props.put(
++                "app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.read-lock",
++                "1000"
++        );
++        props.put(
++                "app.config.integration.mgw.mdp-file-transfer-microgateway.config.physical-card-delivery.read-timeout",
++                "1m"
++        );
+         return props;
+     }
+ 
+@@ -46,14 +56,19 @@ class InboundSkyBagTest extends CamelTestSupport {
+     }
+ 
+     @Test
+-    void shouldMoveFileFromSourceToTarget() throws Exception {
++    void shouldSendFileToSharedProcessingRouteWithSkyBagFileType() throws Exception {
+         AdviceWith.adviceWith(context, Constants.INBOUND_SKY_BAG, route -> {
+             route.replaceFromWith("direct:start");
+-            route.mockEndpointsAndSkip("file:*");
++            route.weaveByToUri(CardDeliveryProcessingRoute.DIRECT_CARD_DELIVERY_PROCESSING)
++                    .replace()
++                    .to("mock:processing");
+         });
+         context.start();
+-        MockEndpoint target = getMockEndpoint("mock:file:target/output");
++        MockEndpoint target = getMockEndpoint("mock:processing");
+         target.expectedMessageCount(1);
++        target.expectedPropertyReceived(Constants.FILE_TYPE, "SKY_BAG");
++        target.expectedMessagesMatches(exchange ->
++                exchange.getProperty("idempotentKey", String.class).startsWith(Constants.INBOUND_SKY_BAG + "::test-file.txt::"));
+         template.sendBodyAndHeader(
+                 "direct:start",
+                 "file-content",
+@@ -62,4 +77,4 @@ class InboundSkyBagTest extends CamelTestSupport {
+         );
+         target.assertIsSatisfied();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/test/java/eg/com/mdi/routes/processors/CardDeliveryFileValidationProcessorTest.java b/src/test/java/eg/com/mdi/routes/processors/CardDeliveryFileValidationProcessorTest.java
+index 04b00e5..8949f7d 100644
+--- a/src/test/java/eg/com/mdi/routes/processors/CardDeliveryFileValidationProcessorTest.java
++++ b/src/test/java/eg/com/mdi/routes/processors/CardDeliveryFileValidationProcessorTest.java
+@@ -35,14 +35,14 @@ class CardDeliveryFileValidationProcessorTest {
+ 
+     @Test
+     void shouldSetFileNameAndTypeForValidCsv() {
+-        when(inMessage.getHeader(Exchange.FILE_NAME, String.class)).thenReturn("MDP_test-file.csv");
++        when(inMessage.getHeader(Exchange.FILE_NAME, String.class)).thenReturn("ABS_test-file.csv");
+         try (MockedStatic<FileOperationUtils> utilities = mockStatic(FileOperationUtils.class)) {
+-            utilities.when(() -> FileOperationUtils.extractFileExtension("MDP_test-file.csv")).thenReturn("csv");
+-            utilities.when(() -> FileOperationUtils.extractFileName("MDP_test-file.csv")).thenReturn("MDP_test-file");
++            utilities.when(() -> FileOperationUtils.extractFileExtension("ABS_test-file.csv")).thenReturn("csv");
++            utilities.when(() -> FileOperationUtils.extractFileName("ABS_test-file.csv")).thenReturn("ABS_test-file");
+             processor.process(exchange);
+         }
+-        verify(exchange).setProperty(Constants.FILE_NAME, "MDP_test-file");
+-        verify(exchange).setProperty(Constants.FILE_TYPE, FileTypeConfig.MDP.name());
++        verify(exchange).setProperty(Constants.FILE_NAME, "ABS_test-file");
++        verify(exchange).setProperty(Constants.FILE_TYPE, FileTypeConfig.ABS.name());
+         verify(idempotencyHandler, never()).handleCorruptedFile(any());
+     }
+ 
+diff --git a/src/test/java/eg/com/mdi/service/CardDeliveryBatchingServiceTest.java b/src/test/java/eg/com/mdi/service/CardDeliveryBatchingServiceTest.java
+index 9825f42..ff9997b 100644
+--- a/src/test/java/eg/com/mdi/service/CardDeliveryBatchingServiceTest.java
++++ b/src/test/java/eg/com/mdi/service/CardDeliveryBatchingServiceTest.java
+@@ -76,15 +76,15 @@ class CardDeliveryBatchingServiceTest {
+ 
+     @Test
+     void testExecute_WithExistingJobParameters_ShouldReuseParameters() throws Exception {
+-        String fileName = "MDP_02-03-2026.csv";
++        String fileName = "ABS_02-03-2026.csv";
+         exchange.setProperty(Constants.FILE_NAME, fileName);
+         exchange.setProperty(Constants.TEMP_FILE_PATH, "/tmp/test.csv");
+-        exchange.setProperty(Constants.FILE_TYPE, "MDP");
++        exchange.setProperty(Constants.FILE_TYPE, "ABS");
+         exchange.setProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME, "corr-id");
+         Map<String, Object> existingParams = new HashMap<>();
+         existingParams.put(Constants.FILE_NAME, fileName);
+         existingParams.put(Constants.TEMP_FILE_PATH, "/old/path.csv");
+-        existingParams.put(Constants.FILE_TYPE, "MDP");
++        existingParams.put(Constants.FILE_TYPE, "ABS");
+         existingParams.put("correlationId", "old-correlation-id");
+         when(cardDeliveryRepository.loadJobParametersByFileName(fileName)).thenReturn(Optional.of(existingParams));
+         when(jobLauncher.run(eq(processFileJob), any(JobParameters.class))).thenReturn(jobExecution);
+@@ -98,10 +98,10 @@ class CardDeliveryBatchingServiceTest {
+ 
+     @Test
+     void testExecute_WithFailedJobStatus_ShouldThrowException() throws Exception {
+-        String fileName = "MDP_02-03-2026.csv";
++        String fileName = "ABS_02-03-2026.csv";
+         exchange.setProperty(Constants.FILE_NAME, fileName);
+         exchange.setProperty(Constants.TEMP_FILE_PATH, "/tmp/test.csv");
+-        exchange.setProperty(Constants.FILE_TYPE, "MDP");
++        exchange.setProperty(Constants.FILE_TYPE, "ABS");
+         exchange.setProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME, "corr-id");
+         when(cardDeliveryRepository.loadJobParametersByFileName(fileName)).thenReturn(Optional.empty());
+         when(jobLauncher.run(eq(processFileJob), any(JobParameters.class))).thenReturn(jobExecution);
+@@ -116,7 +116,7 @@ class CardDeliveryBatchingServiceTest {
+         String fileName = "CORRUPTED_FILE.csv";
+         exchange.setProperty(Constants.FILE_NAME, fileName);
+         exchange.setProperty(Constants.TEMP_FILE_PATH, "/tmp/corrupted.csv");
+-        exchange.setProperty(Constants.FILE_TYPE, "MDP");
++        exchange.setProperty(Constants.FILE_TYPE, "ABS");
+         exchange.setProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME, "corr-id");
+         StepExecution stepExecution = mock(StepExecution.class);
+         ExecutionContext executionContext = new ExecutionContext();
+@@ -156,12 +156,12 @@ class CardDeliveryBatchingServiceTest {
+         String fileName = "EXISTING_FILE.csv";
+         exchange.setProperty(Constants.FILE_NAME, fileName);
+         exchange.setProperty(Constants.TEMP_FILE_PATH, "/tmp/existing.csv");
+-        exchange.setProperty(Constants.FILE_TYPE, "MDP");
++        exchange.setProperty(Constants.FILE_TYPE, "ABS");
+         exchange.setProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME, "corr-id");
+         Map<String, Object> existingParams = new HashMap<>();
+         existingParams.put(Constants.FILE_NAME, fileName);
+         existingParams.put(Constants.TEMP_FILE_PATH, "/old/path.csv");
+-        existingParams.put(Constants.FILE_TYPE, "MDP");
++        existingParams.put(Constants.FILE_TYPE, "ABS");
+         existingParams.put("someIntegerParam", 12345);
+         when(cardDeliveryRepository.loadJobParametersByFileName(fileName)).thenReturn(Optional.of(existingParams));
+         JobParameters result = service.resolveJobParameters(exchange);
+@@ -176,7 +176,7 @@ class CardDeliveryBatchingServiceTest {
+         String fileName = "TEST_FILE.csv";
+         exchange.setProperty(Constants.FILE_NAME, fileName);
+         exchange.setProperty(Constants.TEMP_FILE_PATH, "/tmp/test.csv");
+-        exchange.setProperty(Constants.FILE_TYPE, "MDP");
++        exchange.setProperty(Constants.FILE_TYPE, "ABS");
+         exchange.setProperty(net.atos.mdi.commons.constants.Constants.CORRELATION_ID_LOG_VAR_NAME, "corr-id");
+         when(cardDeliveryRepository.loadJobParametersByFileName(fileName)).thenReturn(Optional.empty());
+         when(jobLauncher.run(eq(processFileJob), any(JobParameters.class))).thenThrow(new RuntimeException("Job launcher failed"));
